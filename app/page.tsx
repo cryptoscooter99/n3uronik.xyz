@@ -24,12 +24,12 @@ const projects: Project[] = [
   },
   {
     number: "02",
-    title: "Tip Doll",
+    title: "SoundMoney",
     discipline: "Sound money interface",
     description:
       "A performer-first payment experience that turns a moment of audience attention into a direct, modern connection.",
     tags: ["Product", "Payments", "Identity"],
-    href: "https://tipdoll.app",
+    href: "https://soundmoney.cloud",
   },
   {
     number: "03",
