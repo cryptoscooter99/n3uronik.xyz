@@ -48,6 +48,14 @@ const projects: Project[] = [
       "A lean multi-market resale operation with disciplined inventory, batch-level accounting, and channel-aware merchandising.",
     tags: ["Commerce", "Operations", "Data"],
   },
+  {
+    number: "05",
+    title: "CLM",
+    discipline: "Agent memory infrastructure",
+    description:
+      "Persistent cross-session memory for AI coding agents—a local-first store with semantic recall and a secret-scanning gate, so hard-won context survives the end of a conversation.",
+    tags: ["Infrastructure", "Local-first", "Developer tools"],
+  },
 ];
 
 const systems = [
@@ -350,7 +358,9 @@ export default function Home() {
       <section className="catalog section-shell" id="index">
         <div className="section-kicker">
           <span>Selected ventures</span>
-          <span>04 active systems</span>
+          <span>
+            {String(projects.length).padStart(2, "0")} active systems
+          </span>
         </div>
         <div className="catalog-heading">
           <h2>Work built to move.</h2>
