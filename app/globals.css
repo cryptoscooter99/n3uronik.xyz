@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./clm/clm.css";
 
 :root {
   --void: #050507;

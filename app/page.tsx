@@ -55,6 +55,7 @@ const projects: Project[] = [
     description:
       "Persistent cross-session memory for AI coding agents—a local-first store with semantic recall and a secret-scanning gate, so hard-won context survives the end of a conversation.",
     tags: ["Infrastructure", "Local-first", "Developer tools"],
+    href: "/clm",
   },
 ];
 
@@ -297,6 +298,7 @@ export default function Home() {
           <a href="#index">Index</a>
           <a href="#systems">Systems</a>
           <a href="#experiments">Experiments</a>
+          <a href="/clm">CLM</a>
           <a href="#contact">Contact</a>
         </nav>
         <div className="studio-status">
