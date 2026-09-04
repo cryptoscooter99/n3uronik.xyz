@@ -83,13 +83,23 @@ const systems = [
 
 type ThreeModule = typeof import("three");
 
+type FieldHandle = {
+  dispose: () => void;
+  /** Stop/start the rAF loop without destroying the GPU context. */
+  setRunning: (running: boolean) => void;
+};
+
 /**
- * Build the WebGL field into `mount`, returning its teardown.
+ * Build the WebGL field into `mount`.
  *
  * Split out of the effect so the `three` module can arrive as an argument
  * rather than a top-level import — see FlowField for why that matters.
  */
-function mountField(THREE: ThreeModule, mount: HTMLDivElement) {
+function mountField(
+  THREE: ThreeModule,
+  mount: HTMLDivElement,
+  reducedMotion: boolean,
+): FieldHandle | undefined {
   let renderer: import("three").WebGLRenderer;
   try {
     renderer = new THREE.WebGLRenderer({
@@ -204,17 +214,45 @@ function mountField(THREE: ThreeModule, mount: HTMLDivElement) {
   scene.add(plane);
 
   let frame = 0;
-  const start = performance.now();
-  const render = (now: number) => {
-    // Reduced-motion never reaches here any more — FlowField returns before
-    // importing three at all, so there is no frozen-frame branch to keep.
-    uniforms.uTime.value = (now - start) / 1000;
-    uniforms.uScroll.value =
-      window.scrollY / Math.max(window.innerHeight, 1);
+  let running = false;
+  // Time is accumulated rather than read off the clock, so a field that was
+  // paused off-screen resumes from where it stopped instead of jumping.
+  let elapsed = 0;
+  let last = performance.now();
+
+  const draw = () => {
+    uniforms.uScroll.value = window.scrollY / Math.max(window.innerHeight, 1);
     renderer.render(scene, camera);
+  };
+
+  const render = (now: number) => {
+    elapsed += (now - last) / 1000;
+    last = now;
+    uniforms.uTime.value = elapsed;
+    draw();
     frame = requestAnimationFrame(render);
   };
-  render(start);
+
+  const setRunning = (next: boolean) => {
+    // prefers-reduced-motion holds a single still frame, exactly as the
+    // original did — the field is composed, just not moving.
+    if (reducedMotion || next === running) return;
+    running = next;
+    if (running) {
+      last = performance.now();
+      frame = requestAnimationFrame(render);
+    } else {
+      cancelAnimationFrame(frame);
+      frame = 0;
+    }
+  };
+
+  if (reducedMotion) {
+    uniforms.uTime.value = 2.4;
+    draw();
+  } else {
+    setRunning(true);
+  }
 
   const onPointerMove = (event: PointerEvent) => {
     const target = new THREE.Vector2(
@@ -227,19 +265,25 @@ function mountField(THREE: ThreeModule, mount: HTMLDivElement) {
     if (!mount) return;
     renderer.setSize(mount.clientWidth, mount.clientHeight);
     uniforms.uResolution.value.set(mount.clientWidth, mount.clientHeight);
+    // A paused or reduced-motion field has no loop to repaint it, so a resize
+    // would otherwise stretch the last frame until something else redrew.
+    if (!running) draw();
   };
 
   window.addEventListener("pointermove", onPointerMove, { passive: true });
   window.addEventListener("resize", onResize);
 
-  return () => {
-    cancelAnimationFrame(frame);
-    window.removeEventListener("pointermove", onPointerMove);
-    window.removeEventListener("resize", onResize);
-    material.dispose();
-    plane.geometry.dispose();
-    renderer.dispose();
-    renderer.domElement.remove();
+  return {
+    setRunning,
+    dispose: () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("resize", onResize);
+      material.dispose();
+      plane.geometry.dispose();
+      renderer.dispose();
+      renderer.domElement.remove();
+    },
   };
 }
 
@@ -251,65 +295,63 @@ function FlowField() {
     if (!mount) return;
 
     /*
-     * ⭐ THREE.JS IS NO LONGER IN THE INITIAL BUNDLE.
+     * ⭐ THREE.JS IS NOT IN THE INITIAL BUNDLE, BUT THE FIELD IS NEVER SKIPPED.
      *
-     * It was a static top-level import, so every visitor downloaded roughly a
-     * megabyte of WebGL library before the page could hydrate — including
-     * phones on venue wifi, and including people who would never see a single
-     * animated frame. The dynamic import below moves it out of the first load
-     * entirely and fetches it only once a field is actually about to be seen.
+     * It used to be a static top-level import, so roughly a megabyte of WebGL
+     * library blocked hydration for everyone. The dynamic import below moves
+     * it out of the first load. That is a pure win: with the static import the
+     * field could not start until the same megabyte had arrived anyway — it
+     * simply held up the rest of the page while it did.
      *
-     * ⭐ AND IT IS SKIPPED OUTRIGHT IN TWO CASES. The CSS fallback underneath
-     * (.flow-fallback) is a designed gradient field, not an empty box, so
-     * standing in for the canvas is a real degradation rather than a hole:
-     *
-     *   prefers-reduced-motion — the old code still shipped the megabyte and
-     *   still built a GPU context, merely freezing time at 2.4s to show one
-     *   static frame. Downloading a renderer to draw a still image is the
-     *   opposite of what that preference asks for.
-     *
-     *   narrow screens — matching the 680px breakpoint the stylesheet already
-     *   uses. This is the payload that hurts most exactly where bandwidth and
-     *   battery are scarcest.
+     * ⚠️ WHAT IS DELIBERATELY NOT DONE HERE: skipping the field on narrow
+     * screens. An earlier pass gated it behind a 680px query to save the
+     * payload on phones, which meant a phone visitor got .flow-fallback — a
+     * still gradient — in place of the animated field. On this site that is
+     * the wrong trade in the wrong direction. The field IS the portfolio
+     * piece; showing its static stand-in to the largest slice of visitors
+     * saves bytes by throwing away the thing the bytes are for. The fallback
+     * exists for browsers with no WebGL at all, not as a mobile tier.
      */
-    const skip =
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches ||
-      window.matchMedia("(max-width: 680px)").matches;
-    if (skip) return;
+    const reducedMotion = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
 
     /*
-     * ⭐ ONE LIVE CONTEXT AT A TIME. FlowField is mounted twice — hero and
-     * footer — and each used to construct its own WebGLRenderer immediately,
-     * so two GPU contexts existed for the whole session even though they are
-     * a full page apart and never visible together. Browsers cap simultaneous
-     * contexts and mobile pays for both in memory and battery.
+     * ⭐ ONLY THE VISIBLE FIELD ANIMATES. FlowField is mounted twice — hero and
+     * footer — a full page apart and never on screen together, so running both
+     * rAF loops all session burns GPU and battery for frames nobody sees.
      *
-     * Building on intersection and tearing down on exit keeps the design
-     * exactly as drawn while making the second context transient.
+     * ⚠️ IT PAUSES, IT DOES NOT TEAR DOWN. Disposing the renderer on scroll-out
+     * meant scrolling back up rebuilt the context and restarted the animation
+     * from t=0 — a visible re-initialisation every time, which is exactly the
+     * kind of seam this design should never show. Pausing the loop keeps the
+     * context and the accumulated time, so returning to a field finds it where
+     * it was. Two idle contexts is far below any browser's limit.
      */
     let cancelled = false;
-    let teardown: (() => void) | null = null;
+    let field: FieldHandle | null = null;
+    let visible = false;
+    let loading = false;
 
     const build = () => {
-      if (cancelled || teardown) return;
+      if (cancelled || field || loading) return;
+      loading = true;
       void import("three").then((THREE) => {
-        // The import can resolve after unmount, or after the field scrolled
-        // back out — both would leak a context nothing will ever dispose.
-        if (cancelled || teardown || !mountRef.current) return;
-        teardown = mountField(THREE, mount) ?? null;
+        loading = false;
+        // The import can resolve after unmount — that would leak a context
+        // nothing will ever dispose.
+        if (cancelled || field || !mountRef.current) return;
+        field = mountField(THREE, mount, reducedMotion) ?? null;
+        field?.setRunning(visible);
       });
-    };
-
-    const destroy = () => {
-      teardown?.();
-      teardown = null;
     };
 
     const observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
-          if (entry.isIntersecting) build();
-          else destroy();
+          visible = entry.isIntersecting;
+          if (visible) build();
+          field?.setRunning(visible);
         }
       },
       // Start fetching just before it scrolls in, so the field is running by
@@ -321,7 +363,8 @@ function FlowField() {
     return () => {
       cancelled = true;
       observer.disconnect();
-      destroy();
+      field?.dispose();
+      field = null;
     };
   }, []);
 
