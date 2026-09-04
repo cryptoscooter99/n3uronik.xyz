@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import * as THREE from "three";
 
 type Project = {
   number: string;
@@ -82,6 +81,168 @@ const systems = [
   },
 ];
 
+type ThreeModule = typeof import("three");
+
+/**
+ * Build the WebGL field into `mount`, returning its teardown.
+ *
+ * Split out of the effect so the `three` module can arrive as an argument
+ * rather than a top-level import — see FlowField for why that matters.
+ */
+function mountField(THREE: ThreeModule, mount: HTMLDivElement) {
+  let renderer: import("three").WebGLRenderer;
+  try {
+    renderer = new THREE.WebGLRenderer({
+      alpha: true,
+      antialias: false,
+      powerPreference: "high-performance",
+    });
+  } catch {
+    mount.classList.add("webgl-unavailable");
+    return;
+  }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.6));
+  renderer.setSize(mount.clientWidth, mount.clientHeight);
+  renderer.setClearColor(0x000000, 0);
+  mount.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const uniforms = {
+    uTime: { value: 0 },
+    uMouse: { value: new THREE.Vector2(0.62, 0.42) },
+    uScroll: { value: 0 },
+    uResolution: {
+      value: new THREE.Vector2(mount.clientWidth, mount.clientHeight),
+    },
+  };
+
+  const material = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    uniforms,
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      precision highp float;
+      varying vec2 vUv;
+      uniform float uTime;
+      uniform float uScroll;
+      uniform vec2 uMouse;
+      uniform vec2 uResolution;
+
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+
+      float noise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(
+          mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+          mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0)), f.x),
+          f.y
+        );
+      }
+
+      float fbm(vec2 p) {
+        float value = 0.0;
+        float amp = 0.5;
+        for (int i = 0; i < 5; i++) {
+          value += amp * noise(p);
+          p = mat2(1.7, 1.2, -1.2, 1.7) * p;
+          amp *= 0.5;
+        }
+        return value;
+      }
+
+      void main() {
+        vec2 uv = vUv;
+        float aspect = uResolution.x / max(uResolution.y, 1.0);
+        vec2 p = (uv - 0.5) * vec2(aspect, 1.0);
+        float t = uTime * 0.055 + uScroll * 0.08;
+
+        float bend = sin(p.x * 1.45 - t) * 0.11;
+        float center = -0.17 + p.x * 0.42 + bend;
+        float d = abs(p.y - center);
+        float n = fbm(vec2(p.x * 2.2 - t, p.y * 3.0 + t * 0.65));
+        float warped = d + (n - 0.5) * 0.23;
+
+        float ribbon = smoothstep(0.38, 0.018, warped);
+        float filament = pow(
+          max(0.0, sin((warped + n * 0.035) * 150.0)),
+          18.0
+        );
+        float hair = pow(max(0.0, sin((warped - n * 0.02) * 265.0)), 34.0);
+        float mouseGlow = exp(-distance(uv, uMouse) * 5.2) * 0.18;
+        float fade = smoothstep(0.02, 0.25, uv.x) *
+          smoothstep(0.0, 0.2, 1.0 - abs(uv.y - 0.5));
+
+        vec3 cyan = vec3(0.03, 0.58, 1.0);
+        vec3 violet = vec3(0.47, 0.16, 1.0);
+        vec3 electric = mix(cyan, violet, smoothstep(0.2, 0.82, uv.x + n * 0.2));
+        vec3 color = electric * (ribbon * 0.32 + filament * 0.8 + hair * 0.42);
+        color += mix(cyan, violet, uv.x) * mouseGlow * ribbon;
+
+        float stars = step(0.997, hash(floor(uv * uResolution.xy * 0.21 + t))) *
+          ribbon * 1.8;
+        color += electric * stars;
+        float alpha = (ribbon * 0.35 + filament * 0.65 + hair * 0.28 + stars) * fade;
+        gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.9));
+      }
+    `,
+  });
+
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  scene.add(plane);
+
+  let frame = 0;
+  const start = performance.now();
+  const render = (now: number) => {
+    // Reduced-motion never reaches here any more — FlowField returns before
+    // importing three at all, so there is no frozen-frame branch to keep.
+    uniforms.uTime.value = (now - start) / 1000;
+    uniforms.uScroll.value =
+      window.scrollY / Math.max(window.innerHeight, 1);
+    renderer.render(scene, camera);
+    frame = requestAnimationFrame(render);
+  };
+  render(start);
+
+  const onPointerMove = (event: PointerEvent) => {
+    const target = new THREE.Vector2(
+      event.clientX / window.innerWidth,
+      1 - event.clientY / window.innerHeight,
+    );
+    uniforms.uMouse.value.lerp(target, 0.12);
+  };
+  const onResize = () => {
+    if (!mount) return;
+    renderer.setSize(mount.clientWidth, mount.clientHeight);
+    uniforms.uResolution.value.set(mount.clientWidth, mount.clientHeight);
+  };
+
+  window.addEventListener("pointermove", onPointerMove, { passive: true });
+  window.addEventListener("resize", onResize);
+
+  return () => {
+    cancelAnimationFrame(frame);
+    window.removeEventListener("pointermove", onPointerMove);
+    window.removeEventListener("resize", onResize);
+    material.dispose();
+    plane.geometry.dispose();
+    renderer.dispose();
+    renderer.domElement.remove();
+  };
+}
+
 function FlowField() {
   const mountRef = useRef<HTMLDivElement>(null);
 
@@ -89,157 +250,78 @@ function FlowField() {
     const mount = mountRef.current;
     if (!mount) return;
 
-    const reducedMotion = window.matchMedia(
-      "(prefers-reduced-motion: reduce)",
-    ).matches;
-    let renderer: THREE.WebGLRenderer;
-    try {
-      renderer = new THREE.WebGLRenderer({
-        alpha: true,
-        antialias: false,
-        powerPreference: "high-performance",
+    /*
+     * ⭐ THREE.JS IS NO LONGER IN THE INITIAL BUNDLE.
+     *
+     * It was a static top-level import, so every visitor downloaded roughly a
+     * megabyte of WebGL library before the page could hydrate — including
+     * phones on venue wifi, and including people who would never see a single
+     * animated frame. The dynamic import below moves it out of the first load
+     * entirely and fetches it only once a field is actually about to be seen.
+     *
+     * ⭐ AND IT IS SKIPPED OUTRIGHT IN TWO CASES. The CSS fallback underneath
+     * (.flow-fallback) is a designed gradient field, not an empty box, so
+     * standing in for the canvas is a real degradation rather than a hole:
+     *
+     *   prefers-reduced-motion — the old code still shipped the megabyte and
+     *   still built a GPU context, merely freezing time at 2.4s to show one
+     *   static frame. Downloading a renderer to draw a still image is the
+     *   opposite of what that preference asks for.
+     *
+     *   narrow screens — matching the 680px breakpoint the stylesheet already
+     *   uses. This is the payload that hurts most exactly where bandwidth and
+     *   battery are scarcest.
+     */
+    const skip =
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches ||
+      window.matchMedia("(max-width: 680px)").matches;
+    if (skip) return;
+
+    /*
+     * ⭐ ONE LIVE CONTEXT AT A TIME. FlowField is mounted twice — hero and
+     * footer — and each used to construct its own WebGLRenderer immediately,
+     * so two GPU contexts existed for the whole session even though they are
+     * a full page apart and never visible together. Browsers cap simultaneous
+     * contexts and mobile pays for both in memory and battery.
+     *
+     * Building on intersection and tearing down on exit keeps the design
+     * exactly as drawn while making the second context transient.
+     */
+    let cancelled = false;
+    let teardown: (() => void) | null = null;
+
+    const build = () => {
+      if (cancelled || teardown) return;
+      void import("three").then((THREE) => {
+        // The import can resolve after unmount, or after the field scrolled
+        // back out — both would leak a context nothing will ever dispose.
+        if (cancelled || teardown || !mountRef.current) return;
+        teardown = mountField(THREE, mount) ?? null;
       });
-    } catch {
-      mount.classList.add("webgl-unavailable");
-      return;
-    }
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.6));
-    renderer.setSize(mount.clientWidth, mount.clientHeight);
-    renderer.setClearColor(0x000000, 0);
-    mount.appendChild(renderer.domElement);
+    };
 
-    const scene = new THREE.Scene();
-    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-    const uniforms = {
-      uTime: { value: 0 },
-      uMouse: { value: new THREE.Vector2(0.62, 0.42) },
-      uScroll: { value: 0 },
-      uResolution: {
-        value: new THREE.Vector2(mount.clientWidth, mount.clientHeight),
+    const destroy = () => {
+      teardown?.();
+      teardown = null;
+    };
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) build();
+          else destroy();
+        }
       },
-    };
-
-    const material = new THREE.ShaderMaterial({
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      uniforms,
-      vertexShader: `
-        varying vec2 vUv;
-        void main() {
-          vUv = uv;
-          gl_Position = vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        precision highp float;
-        varying vec2 vUv;
-        uniform float uTime;
-        uniform float uScroll;
-        uniform vec2 uMouse;
-        uniform vec2 uResolution;
-
-        float hash(vec2 p) {
-          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
-        }
-
-        float noise(vec2 p) {
-          vec2 i = floor(p);
-          vec2 f = fract(p);
-          f = f * f * (3.0 - 2.0 * f);
-          return mix(
-            mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
-            mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0)), f.x),
-            f.y
-          );
-        }
-
-        float fbm(vec2 p) {
-          float value = 0.0;
-          float amp = 0.5;
-          for (int i = 0; i < 5; i++) {
-            value += amp * noise(p);
-            p = mat2(1.7, 1.2, -1.2, 1.7) * p;
-            amp *= 0.5;
-          }
-          return value;
-        }
-
-        void main() {
-          vec2 uv = vUv;
-          float aspect = uResolution.x / max(uResolution.y, 1.0);
-          vec2 p = (uv - 0.5) * vec2(aspect, 1.0);
-          float t = uTime * 0.055 + uScroll * 0.08;
-
-          float bend = sin(p.x * 1.45 - t) * 0.11;
-          float center = -0.17 + p.x * 0.42 + bend;
-          float d = abs(p.y - center);
-          float n = fbm(vec2(p.x * 2.2 - t, p.y * 3.0 + t * 0.65));
-          float warped = d + (n - 0.5) * 0.23;
-
-          float ribbon = smoothstep(0.38, 0.018, warped);
-          float filament = pow(
-            max(0.0, sin((warped + n * 0.035) * 150.0)),
-            18.0
-          );
-          float hair = pow(max(0.0, sin((warped - n * 0.02) * 265.0)), 34.0);
-          float mouseGlow = exp(-distance(uv, uMouse) * 5.2) * 0.18;
-          float fade = smoothstep(0.02, 0.25, uv.x) *
-            smoothstep(0.0, 0.2, 1.0 - abs(uv.y - 0.5));
-
-          vec3 cyan = vec3(0.03, 0.58, 1.0);
-          vec3 violet = vec3(0.47, 0.16, 1.0);
-          vec3 electric = mix(cyan, violet, smoothstep(0.2, 0.82, uv.x + n * 0.2));
-          vec3 color = electric * (ribbon * 0.32 + filament * 0.8 + hair * 0.42);
-          color += mix(cyan, violet, uv.x) * mouseGlow * ribbon;
-
-          float stars = step(0.997, hash(floor(uv * uResolution.xy * 0.21 + t))) *
-            ribbon * 1.8;
-          color += electric * stars;
-          float alpha = (ribbon * 0.35 + filament * 0.65 + hair * 0.28 + stars) * fade;
-          gl_FragColor = vec4(color, clamp(alpha, 0.0, 0.9));
-        }
-      `,
-    });
-
-    const plane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
-    scene.add(plane);
-
-    let frame = 0;
-    const start = performance.now();
-    const render = (now: number) => {
-      uniforms.uTime.value = reducedMotion ? 2.4 : (now - start) / 1000;
-      uniforms.uScroll.value =
-        window.scrollY / Math.max(window.innerHeight, 1);
-      renderer.render(scene, camera);
-      if (!reducedMotion) frame = requestAnimationFrame(render);
-    };
-    render(start);
-
-    const onPointerMove = (event: PointerEvent) => {
-      const target = new THREE.Vector2(
-        event.clientX / window.innerWidth,
-        1 - event.clientY / window.innerHeight,
-      );
-      uniforms.uMouse.value.lerp(target, 0.12);
-    };
-    const onResize = () => {
-      if (!mount) return;
-      renderer.setSize(mount.clientWidth, mount.clientHeight);
-      uniforms.uResolution.value.set(mount.clientWidth, mount.clientHeight);
-    };
-
-    window.addEventListener("pointermove", onPointerMove, { passive: true });
-    window.addEventListener("resize", onResize);
+      // Start fetching just before it scrolls in, so the field is running by
+      // the time it is actually on screen.
+      { rootMargin: "300px" },
+    );
+    observer.observe(mount);
 
     return () => {
-      cancelAnimationFrame(frame);
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("resize", onResize);
-      material.dispose();
-      plane.geometry.dispose();
-      renderer.dispose();
-      renderer.domElement.remove();
+      cancelled = true;
+      observer.disconnect();
+      destroy();
     };
   }, []);
 
